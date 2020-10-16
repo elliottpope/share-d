@@ -1,37 +1,22 @@
-package main
+package server
 
 import (
 	"encoding/json"
-	"flag"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 
+	"github.com/elliottpope/share-d/backends"
+	"github.com/elliottpope/share-d/secrets"
 	"github.com/google/uuid"
 	"github.com/julienschmidt/httprouter"
 )
 
-// Secret ... defines the value of an encrypted secret to be stored along with information about how it is encrypted.
-type Secret struct {
-	EncryptedValue        string        `json:"value"`
-	EncryptedSymmetricKey *SymmetricKey `json:"symmetric-key,omitempty"`
-	PrivateKeyAlias       string        `json:"private-key-alias,omitempty"`
-}
-
-// SecretMetadata ... defines the metadata for locating or listing the secrets for a given user/org/team. Provides the location of the actual secret in the backend.
-type SecretMetadata struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Location string `json:"-"`
-}
-
-// SymmetricKey ... defines an encryption key along with the necessary metadata for a client to use it.
-type SymmetricKey struct {
-	Algorithm string `json:"alg,omitempty"`
-	Method    string `json:"method,omitempty"`
-	Padding   string `json:"padding,omitempty"`
-	Value     string `json:"value,omitempty"`
+// Server ... component to receive and return secrets over HTTP
+type Server struct {
+	Backend backends.Backend
+	Router  *httprouter.Router
 }
 
 // HTTPError ... encapsulates details of an HTTP Error to be raised and displayed to the client
@@ -42,69 +27,29 @@ type HTTPError struct {
 	Cause    error  `json:"-"`
 }
 
-// Algorithm ... returns the full algorithm for using the key to encrypt or decrypt. e.g. AES/GCM/NoPadding
-func Algorithm(key *SymmetricKey) string {
-	return key.Algorithm + "/" + key.Method + "/" + key.Padding
+// Start ... starts the server and registers the necessary HTTP endpoints
+func (server *Server) Start() {
+	server.registerEndpoints()
+	log.Fatal(http.ListenAndServe(":8080", server.Router))
 }
 
-// Value ... returns to Base64 encoded value of the symmetric key. Note, if passed over the network this value will be encrypted.
-func Value(key *SymmetricKey) string {
-	return key.Value
+func (server *Server) registerEndpoints() *httprouter.Router {
+	server.Router = httprouter.New()
+
+	server.Router.HandlerFunc("LIST", "/secrets", server.listSecrets)
+	server.Router.HandlerFunc("GET", "/secrets/:id", getSecret)
+	server.Router.HandlerFunc("POST", "/secrets", addSecret)
+	server.Router.HandlerFunc("PUT", "/secrets/:id", replaceSecret)
+	server.Router.HandlerFunc("PATCH", "/secrets/:id", updateSecret)
+	server.Router.HandlerFunc("DELETE", "/secrets/:id", deleteSecret)
+
+	return server.Router
 }
 
-// Key ... defines an interface that all keys must implement
-type Key interface {
-	Value() string
-	Algorithm() string
-}
+func (server *Server) listSecrets(w http.ResponseWriter, r *http.Request) {
 
-// Configuration ... data structure for holding the confguration of the Share-d server
-type Configuration struct {
-	Backend string
-}
+	metadata, err := server.Backend.List()
 
-var (
-	config *Configuration = &Configuration{}
-
-	// ErrorLogger ... global error logger
-	ErrorLogger *log.Logger = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile)
-)
-
-func main() {
-	backendLocation := flag.String("backend", "./data", "the location to store secrets and metadata")
-
-	flag.Parse()
-
-	config.Backend = *backendLocation
-
-	if _, err := os.Stat(*backendLocation); os.IsNotExist(err) {
-		os.Mkdir(*backendLocation, 0666)
-	}
-
-	router := registerEndpoints()
-	startServer(router)
-
-}
-
-func registerEndpoints() *httprouter.Router {
-	router := httprouter.New()
-
-	router.HandlerFunc("LIST", "/secrets", listSecrets)
-	router.HandlerFunc("GET", "/secrets/:id", getSecret)
-	router.HandlerFunc("POST", "/secrets", addSecret)
-	router.HandlerFunc("PUT", "/secrets/:id", replaceSecret)
-	router.HandlerFunc("PATCH", "/secrets/:id", updateSecret)
-	router.HandlerFunc("DELETE", "/secrets/:id", deleteSecret)
-
-	return router
-}
-
-func startServer(router *httprouter.Router) {
-	log.Fatal(http.ListenAndServe(":8080", router))
-}
-
-func listSecrets(w http.ResponseWriter, r *http.Request) {
-	files, err := ioutil.ReadDir(config.Backend)
 	if err != nil {
 		raiseHTTPError(w, &HTTPError{
 			Message:  "There was an error while finding secrets",
@@ -114,14 +59,7 @@ func listSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var secrets = make([]SecretMetadata, len(files))
-	for i, file := range files {
-		secrets[i] = SecretMetadata{
-			ID: file.Name(),
-		}
-	}
-
-	output, err := json.Marshal(secrets)
+	output, err := json.Marshal(metadata)
 
 	if err != nil {
 		log.Print(err)
@@ -136,25 +74,11 @@ func listSecrets(w http.ResponseWriter, r *http.Request) {
 	w.Write(output)
 }
 
-func getSecret(w http.ResponseWriter, r *http.Request) {
+func (server *Server) getSecret(w http.ResponseWriter, r *http.Request) {
 	params := httprouter.ParamsFromContext(r.Context())
 	id := params.ByName("id")
 
-	file, err := os.Open(config.Backend + "/" + id)
-	defer file.Close()
-
-	if err != nil {
-		raiseHTTPError(w, &HTTPError{
-			Message:  "Share-d was unable to locate the secret with ID: " + id,
-			Cause:    err,
-			HTTPCode: 404,
-		})
-		return
-	}
-
-	secretBytes, err := ioutil.ReadAll(file)
-	var secret Secret
-	err = json.Unmarshal(secretBytes, &secret)
+	file, err := server.Backend.Read(id)
 
 	if err != nil {
 		raiseHTTPError(w, &HTTPError{
@@ -194,7 +118,7 @@ func addSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var secret Secret
+	var secret secrets.Secret
 
 	json.Unmarshal(requestBody, &secret)
 
@@ -206,38 +130,25 @@ func addSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := uuid.New()
+	metadata, err := server.Backend.Save(secret)
 
-	if _, err := os.Stat(config.Backend + "/" + id.String()); os.IsNotExist(err) {
-		file, err := os.Create(config.Backend + "/" + id.String())
-		if err != nil {
-			raiseHTTPError(w, &HTTPError{
-				HTTPCode: 500,
-				Message:  "An unexpected error occured",
-				Cause:    err,
-			})
-			return
-		}
-		// can ignore error here since we just unmarshalled it from JSON
-		output, _ := json.Marshal(&secret)
-		_, err = file.Write(output)
-		if err != nil {
-			raiseHTTPError(w, &HTTPError{
-				HTTPCode: 500,
-				Message:  "Share-d was unable to store the provided secret",
-				Cause:    err,
-			})
-			return
-		}
-
-		w.Write(output)
-	} else {
+	if type(err) == backends.SecretAlreadyExistsError {
 		raiseHTTPError(w, &HTTPError{
 			HTTPCode: 409,
 			Message:  "Secret with the given ID already exists",
 		})
 		return
+	} else if err != nil {
+		raiseHTTPError(w, &HTTPError{
+			HTTPCode: 500,
+			Message:  "Share-d was unable to store the provided secret",
+			Cause:    err,
+		})
+		return
 	}
+
+	output, _ := json.Marshal(&secret)
+	w.Write(output)
 }
 
 func replaceSecret(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +168,7 @@ func replaceSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var secret Secret
+	var secret secrets.Secret
 
 	json.Unmarshal(requestBody, &secret)
 
@@ -318,7 +229,7 @@ func updateSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var secret Secret
+	var secret secrets.Secret
 
 	json.Unmarshal(requestBody, &secret)
 
@@ -336,7 +247,7 @@ func updateSecret(w http.ResponseWriter, r *http.Request) {
 		}
 
 		secretBytes, err := ioutil.ReadAll(file)
-		var existingSecret Secret
+		var existingSecret secrets.Secret
 		err = json.Unmarshal(secretBytes, &existingSecret)
 
 		if secret.EncryptedValue == "" {
